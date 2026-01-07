@@ -10,59 +10,51 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // --- HARDWARE ---
 const int sensorPin = A0;   
-const int buttonPin = 2;    
+const int buttonPin = 2;    // Button to Ground
 
-// --- CALIBRATION ---
+// --- CALIBRATION (UPDATED) ---
 float sensorOffset = 0; 
-
-// 1. STABLE K (As requested)
-float k_constant = 46.5; 
-
-// 2. VOLUME MULTIPLIER (The Magic Fix)
-// Since k=46.5 gives ~0.3L, we multiply by 1.7 to get ~0.5L
-// accurate volume without adding noise.
-float VOLUME_SCALER = 1.7; 
-
-// --- SMOOTHING ---
-float filteredValue = 0.0;  
-float alpha = 0.1;          
+float k_constant = 185.0; 
 
 // --- VARIABLES ---
 unsigned long previousMillis = 0;   
-unsigned long lastDisplayTime = 0;  
+float currentTidalVol = 0.0;        
+float peakFlow = 0.0;               
+bool isBreathing = false;           
 unsigned long breathStopTimer = 0;  
 
-float currentVol = 0.0;        
-float peakFlow = 0.0;
-float previousFlow = 0.0; 
-bool isBreathing = false;           
-
-// --- THRESHOLDS ---
-// Low thresholds to catch the full breath, relying on Deadzone for silence
-const float START_THRESHOLD = 2.0;  
-const float CUTOFF_THRESHOLD = 1.0; 
-const int BREATH_TIMEOUT = 1000;    // Wait 1 sec to confirm stop
+// --- SETTINGS (UPDATED) ---
+// CHANGED: Increased threshold to 8.0 to ignore small noise so result triggers reliably
+const float FLOW_THRESHOLD = 8.0;   
+const int BREATH_TIMEOUT = 1200;    // Wait 1.2 sec after flow stops before showing result
 
 void setup() {
   Serial.begin(9600);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for(;;); }
+
+  // 1. Initialize Screen
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    for(;;); // Halt if screen fails
+  }
+
+  // 2. Initialize Button
   pinMode(buttonPin, INPUT_PULLUP); 
    
-  // Calibration
+  // 3. Calibration Screen
   display.clearDisplay();
-  display.setTextColor(WHITE);
   display.setTextSize(1);
+  display.setTextColor(WHITE);
   display.setCursor(10, 20);
   display.println("CALIBRATING...");
   display.setCursor(10, 35);
-  display.println("Stay Still...");
+  display.println("Ensure Flow is 0");
   display.display();
   delay(1500); 
 
+  // 4. Calibrate Sensor
   long total = 0;
   for(int i=0; i<50; i++){
     total += analogRead(sensorPin);
-    delay(5);
+    delay(10);
   }
   sensorOffset = total / 50.0;
    
@@ -71,27 +63,20 @@ void setup() {
 }
 
 void loop() {
-  // 1. Time
+  // --- TIME CALC ---
   unsigned long currentMillis = millis();
   float dt = (currentMillis - previousMillis) / 1000.0; 
   previousMillis = currentMillis;
 
-  // 2. Read Sensor
+  // --- READ SENSOR ---
   float rawValue = analogRead(sensorPin);
   float adjustedValue = rawValue - sensorOffset;
   
-  // --- 3. ZERO LOCK (DEADZONE) ---
-  // If the raw sensor value is tiny (noise 1, 2, or 3), FORCE it to 0.
-  // This guarantees the math hits 0.00 and the breath STOPS.
-  if (adjustedValue < 5.4) {
-    adjustedValue = 0;
-  }
+  // Hard zero clamp to fix "Not Holding" issue
+  if (adjustedValue < 3) adjustedValue = 0; 
 
-  // Smooth the data
-  filteredValue = (filteredValue * (1.0 - alpha)) + (adjustedValue * alpha);
-
-  // 4. Physics
-  float voltage = filteredValue * (5.0 / 1023.0);
+  // --- PHYSICS ---
+  float voltage = adjustedValue * (5.0 / 1023.0);
   float pressurePa = (voltage / 0.45) * 1000.0;
    
   float flowRate = 0;
@@ -99,113 +84,111 @@ void loop() {
     flowRate = k_constant * sqrt(pressurePa / 1000.0); 
   }
 
-  // 5. Volume Integration
-  if (flowRate > START_THRESHOLD) {
+  // --- BREATHING LOGIC ---
+  if (flowRate > FLOW_THRESHOLD) {
+    // We are breathing
     isBreathing = true;
-    breathStopTimer = millis(); 
+    breathStopTimer = millis(); // Reset the stop timer
+    
     if (flowRate > peakFlow) peakFlow = flowRate;
+    currentTidalVol += (flowRate / 60.0) * dt;
+
+  } else {
+    // Flow is very low (user stopped blowing)
+    // Check if enough time has passed to confirm breath is done
+    if (isBreathing && (millis() - breathStopTimer > BREATH_TIMEOUT)) {
+      
+      showResultsWindow(); // <--- GO TO HOLD SCREEN
+      
+      // Reset after returning from hold screen
+      isBreathing = false;
+      currentTidalVol = 0;
+      peakFlow = 0;
+    }
   }
 
-  if (isBreathing && flowRate > CUTOFF_THRESHOLD) {
-     float averageFlow = (flowRate + previousFlow) / 2.0;
-     
-     // We calculate raw volume here...
-     float instantVol = (averageFlow / 60.0) * dt;
-     
-     // ...and apply the SCALER here to get to 0.5L
-     currentVol += (instantVol * VOLUME_SCALER);
-  }
-  previousFlow = flowRate;
-
-  // 6. Stop Logic
-  if (isBreathing) {
-     // Because of the Zero Lock, flowRate will definitely hit 0.0 here
-     if (flowRate <= CUTOFF_THRESHOLD) {
-        if (millis() - breathStopTimer > BREATH_TIMEOUT) {
-           showResultsWindow(); 
-           
-           isBreathing = false;
-           currentVol = 0;
-           peakFlow = 0;
-           filteredValue = 0; 
-           previousFlow = 0; 
-        }
-     }
-  }
-
-  // 7. Update Screen
-  if (millis() - lastDisplayTime > 150) {
-    updateLiveScreen(flowRate);
-    lastDisplayTime = millis();
-  }
-}
-
-void updateLiveScreen(float flow) {
+  // --- DRAW LIVE SCREEN ---
   display.clearDisplay();
+
+  // Header
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print("LIVE");
+  display.print("LIVE MONITOR");
   display.drawLine(0, 10, 128, 10, WHITE);
 
+  // Flow Rate
   display.setTextSize(2);
   display.setCursor(0, 20);
-  display.print(flow, 1); 
+  display.print(flowRate, 1); 
   display.setTextSize(1);
   display.print(" L/m");
 
+  // Volume
   display.setCursor(0, 45);
   display.print("Vol: ");
-  display.print(currentVol, 2); 
+  display.print(currentTidalVol, 2); 
   display.print(" L");
 
-  // Bar Graph
-  int maxScale = (peakFlow > 100) ? 600 : 100;
-  int barFlow = flow; if (barFlow > maxScale) barFlow = maxScale; 
-  int barWidth = map(barFlow, 0, maxScale, 0, 128); 
+  // --- FIXED BAR GRAPH ---
+  // Scale changed: 0 to 100 L/min (Better for normal breathing)
+  // If flow > 100, bar stays full.
+  int barFlow = flowRate;
+  if (barFlow > 100) barFlow = 100; 
+  
+  int barWidth = map(barFlow, 0, 100, 0, 128); 
   display.fillRect(0, 56, barWidth, 8, WHITE);
+
   display.display();
 }
 
+// --- RESULT HOLDING FUNCTION ---
 void showResultsWindow() {
   display.clearDisplay();
+  
+  // Title
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print("--- RESULT ---");
   display.drawLine(0, 10, 128, 10, WHITE);
 
- // 1. Peak Flow Rate
-  display.setCursor(0, 20);
+  // Peak Flow
+  display.setCursor(0, 15);
   display.setTextSize(1);
-  display.println("MAX FLOW RATE:");
-  
-  display.setTextSize(1.4);
-  display.print(peakFlow, 1);
-  display.setTextSize(1);
-  display.println(" L/min");
-
-  // 2. Tidal Volume
-  display.setCursor(0,37);
-  display.setTextSize(1);
-  display.println("TIDAL VOLUME:");
-  
+  display.println("PEAK FLOW:");
   display.setTextSize(2);
-  display.print(currentVol, 3); 
+  display.print(peakFlow, 0);
+  display.setTextSize(1);
+  display.println(" L/m");
+
+  // Tidal Volume
+  display.setCursor(0, 42);
+  display.setTextSize(1);
+  display.println("TIDAL VOL:");
+  display.setTextSize(2);
+  display.print(currentTidalVol, 2); 
   display.setTextSize(1);
   display.println(" L");
 
+  // Reset Prompt
   display.setTextSize(1);
   display.setCursor(80, 55);
   display.print("[RESET]");
+
   display.display();
   
-  while(digitalRead(buttonPin) == HIGH) { }
+  // --- THE HOLD LOOP ---
+  // The code gets stuck here intentionally until you press the button.
+  // Ensure Button is connected to PIN 2 and GROUND.
+  while(digitalRead(buttonPin) == HIGH) {
+     // Do nothing, just wait.
+  }
   
+  // Button was pressed, exit loop and restart
   display.clearDisplay();
   display.setCursor(40, 30);
   display.print("RESET!");
   display.display();
   delay(500); 
-  previousMillis = millis(); 
-  filteredValue = 0; 
-  previousFlow = 0;
+  
+  previousMillis = millis(); // Reset timer so volume doesn't jump
 }
